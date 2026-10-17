@@ -1,0 +1,4 @@
+ops.db*
+__pycache__/
+.env
+*.pyc

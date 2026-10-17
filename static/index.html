@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Ops Under Pressure</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body{font-family:system-ui,sans-serif;margin:0;background:#f5f6f8;color:#1a1d23}
+header{background:#1f2937;color:#fff;padding:10px 20px;display:flex;justify-content:space-between;align-items:center}
+main{display:flex;gap:16px;padding:16px;align-items:flex-start}
+.card{background:#fff;border:1px solid #dde1e7;border-radius:8px;padding:14px}
+#list{flex:1.3;min-width:0}#detail{flex:1;min-width:0}
+button{cursor:pointer;border:1px solid #b6bdc9;background:#fff;border-radius:6px;padding:5px 10px}
+button.primary{background:#2563eb;color:#fff;border-color:#2563eb}button:disabled{opacity:.5}
+input,select,textarea{padding:5px;border:1px solid #b6bdc9;border-radius:6px;font:inherit}
+.tabs button.on{background:#1f2937;color:#fff}.row{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0}
+table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:6px;border-bottom:1px solid #eef0f3;font-size:14px}
+tr.item{cursor:pointer}tr.item:hover,tr.sel{background:#eef4ff}
+.pill{border-radius:10px;padding:1px 8px;font-size:12px;background:#e5e7eb}.urgent{background:#fecaca}.high{background:#fed7aa}
+.banner{background:#fee2e2;border:1px solid #f87171;padding:8px;border-radius:6px;margin-bottom:8px}
+.ev{font-size:13px;border-left:3px solid #cbd5e1;padding:2px 8px;margin:6px 0}.muted{color:#6b7280;font-size:13px}
+#login{max-width:340px;margin:60px auto}
+</style></head><body>
+<div id="app"></div>
+<script>
+// All user-visible strings go through esc() -> no XSS from titles/comments.
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const S = {token: sessionStorage.getItem("token"), me: null, view: "assigned_to_me", items: [], cursor: null,
+           sel: null, activity: [], members: [], filters: {q: "", status: "", priority: "", team: ""}, counts: {}, banner: "", busy: false};
+
+async function api(method, path, body, idem) {
+  const h = {"Content-Type": "application/json"};
+  if (S.token) h.Authorization = "Bearer " + S.token;
+  if (idem) h["Idempotency-Key"] = idem;
+  const r = await fetch("/api" + path, {method, headers: h, body: body ? JSON.stringify(body) : undefined});
+  const data = await r.json();
+  if (!r.ok) { const e = new Error(data.error?.message || "Request failed"); e.status = r.status; e.data = data; throw e; }
+  return data;
+}
+
+async function login(e) {
+  e.preventDefault();
+  try {
+    const r = await api("POST", "/login", {email: document.getElementById("em").value, password: document.getElementById("pw").value});
+    S.token = r.token; sessionStorage.setItem("token", r.token); await boot();
+  } catch (err) { document.getElementById("lerr").textContent = err.message; }
+}
+function logout() { sessionStorage.removeItem("token"); S.token = null; S.me = null; render(); }
+
+async function boot() {
+  try { S.me = await api("GET", "/me"); } catch { return logout(); }
+  await refresh(); render();
+}
+async function refresh() {
+  S.counts = (await api("GET", "/dashboard")).counts;
+  await loadList(true);
+}
+async function loadList(reset) {
+  const p = new URLSearchParams({view: S.view, limit: 25});
+  for (const [k, v] of Object.entries(S.filters)) if (v) p.set(k, v);
+  if (!reset && S.cursor) p.set("cursor", S.cursor);
+  const r = await api("GET", "/items?" + p);
+  S.items = reset ? r.items : S.items.concat(r.items); S.cursor = r.next_cursor;
+  if (!reset) render();
+}
+async function openItem(id) {
+  S.banner = "";
+  S.sel = (await api("GET", "/items/" + id));
+  S.activity = (await api("GET", `/items/${id}/activity?limit=200`)).events;
+  S.members = S.sel.my_role === "lead" || S.sel.my_role === "admin" ? (await api("GET", `/teams/${S.sel.team_id}/members`)).members : [];
+  render();
+}
+
+// Optimistic action: apply locally, send with an Idempotency-Key, roll back + explain on 403/409/422.
+async function act(label, optimistic, call) {
+  if (S.busy) return; S.busy = true;
+  const snapshot = JSON.stringify(S.sel);
+  S.banner = ""; optimistic(S.sel); render();
+  try {
+    S.sel = await call(crypto.randomUUID());
+  } catch (err) {
+    S.sel = JSON.parse(snapshot);
+    if (err.status === 409 && err.data.current) {
+      S.sel = err.data.current;
+      S.banner = `${label} failed: ${err.message}. The item was reloaded with the latest data.`;
+    } else S.banner = `${label} failed: ${err.message}`;
+  }
+  S.busy = false;
+  await refresh();
+  if (S.sel) S.activity = (await api("GET", `/items/${S.sel.id}/activity?limit=200`)).events;
+  render();
+}
+const claim = () => act("Claim", it => { it.assignee_id = S.me.user.id; it.assignee_name = S.me.user.name; },
+  k => api("POST", `/items/${S.sel.id}/claim`, {}, k));
+const move = to => act("Transition", it => { it.status = to; it.allowed_transitions = []; },
+  k => api("POST", `/items/${S.sel.id}/transition`, {to, version: S.sel.version}, k));
+const setPriority = v => act("Edit", it => { it.priority = v; }, k => api("PATCH", `/items/${S.sel.id}`, {version: S.sel.version, priority: v}, k));
+const assign = v => act("Reassign", it => {}, k => api("PATCH", `/items/${S.sel.id}`, {version: S.sel.version, assignee_id: v ? +v : null}, k));
+async function comment() {
+  const el = document.getElementById("cm"); if (!el.value.trim()) return;
+  try { await api("POST", `/items/${S.sel.id}/comments`, {body: el.value}, crypto.randomUUID()); await openItem(S.sel.id); }
+  catch (err) { S.banner = err.message; render(); }
+}
+async function create(e) {
+  e.preventDefault(); const f = new FormData(e.target);
+  try {
+    const it = await api("POST", "/items", {title: f.get("title"), team_id: +f.get("team"), type: f.get("type"), priority: f.get("priority")}, crypto.randomUUID());
+    await refresh(); await openItem(it.id);
+  } catch (err) { S.banner = err.message; render(); }
+}
+function setView(v) { S.view = v; S.sel = null; refresh().then(render); }
+function filter() { for (const k in S.filters) S.filters[k] = document.getElementById("f_" + k).value; loadList(true).then(render); }
+const reloadSel = () => openItem(S.sel.id);
+
+function describe(e) {
+  const d = e.data;
+  switch (e.type) {
+    case "created": return "created the item";
+    case "state_changed": return `moved ${d.from} → ${d.to}`;
+    case "priority_changed": return `priority ${d.from} → ${d.to}`;
+    case "assignee_changed": return `assignee changed (user ${d.from ?? "none"} → ${d.to ?? "none"})${d.via ? " via " + d.via : ""}`;
+    case "edited": return "edited " + Object.keys(d.fields).join(", ");
+    case "comment": return "commented: " + d.body;
+    default: return e.type;
+  }
+}
+
+function render() {
+  const app = document.getElementById("app");
+  if (!S.me) {
+    app.innerHTML = `<form id="login" class="card" onsubmit="login(event)"><h2>Operations Under Pressure</h2>
+      <div class="row"><input id="em" placeholder="email" value="alice@demo.test" style="width:100%"></div>
+      <div class="row"><input id="pw" type="password" placeholder="password" value="password123" style="width:100%"></div>
+      <button class="primary">Log in</button><p id="lerr" style="color:#b91c1c"></p>
+      <p class="muted">Demo users: admin, alice (lead), bob (member), gina (viewer), ivan (Platform only) @demo.test · password123</p></form>`;
+    return;
+  }
+  const views = [["assigned_to_me", "Assigned to me"], ["unassigned_urgent", "Unassigned urgent"], ["awaiting_my_approval", "Awaiting my approval"]];
+  const it = S.sel;
+  app.innerHTML = `<header><b>Ops Under Pressure</b><span>${esc(S.me.user.name)} · ${S.me.teams.map(t => esc(t.name) + " (" + t.role + ")").join(", ")}
+    <button onclick="logout()">Log out</button></span></header>
+  <main><section id="list" class="card">
+    <div class="tabs row">${views.map(([k, l]) => `<button class="${S.view === k ? "on" : ""}" onclick="setView('${k}')">${l} (${S.counts[k] ?? 0})</button>`).join("")}</div>
+    <div class="row">
+      <input id="f_q" placeholder="search title/description" value="${esc(S.filters.q)}" onchange="filter()">
+      <select id="f_status" onchange="filter()"><option value="">any status</option>${["OPEN","IN_PROGRESS","AWAITING_APPROVAL","RESOLVED","CLOSED"].map(s => `<option ${S.filters.status === s ? "selected" : ""}>${s}</option>`).join("")}</select>
+      <select id="f_priority" onchange="filter()"><option value="">any priority</option>${["low","medium","high","urgent"].map(s => `<option ${S.filters.priority === s ? "selected" : ""}>${s}</option>`).join("")}</select>
+      <select id="f_team" onchange="filter()"><option value="">all my teams</option>${S.me.teams.map(t => `<option value="${t.id}" ${S.filters.team == t.id ? "selected" : ""}>${esc(t.name)}</option>`).join("")}</select>
+    </div>
+    <table><tr><th>#</th><th>Title</th><th>Status</th><th>Priority</th><th>Assignee</th></tr>
+    ${S.items.map(i => `<tr class="item ${it && it.id === i.id ? "sel" : ""}" onclick="openItem(${i.id})"><td>${i.id}</td><td>${esc(i.title)}<div class="muted">${esc(i.team_name)}</div></td>
+      <td>${i.status}</td><td><span class="pill ${i.priority}">${i.priority}</span></td><td>${esc(i.assignee_name || "—")}</td></tr>`).join("") || `<tr><td colspan=5 class="muted">Nothing here.</td></tr>`}</table>
+    ${S.cursor ? `<div class="row"><button onclick="loadList(false)">Load more</button></div>` : ""}
+    <details><summary>New item</summary><form onsubmit="create(event)" class="row">
+      <input name="title" placeholder="title" required>
+      <select name="team">${S.me.teams.map(t => `<option value="${t.id}">${esc(t.name)}</option>`).join("")}</select>
+      <select name="type">${["task","incident","customer_issue","payment","compliance"].map(s => `<option>${s}</option>`).join("")}</select>
+      <select name="priority">${["medium","low","high","urgent"].map(s => `<option>${s}</option>`).join("")}</select><button class="primary">Create</button></form></details>
+  </section>
+  <section id="detail" class="card">${!it ? `<p class="muted">Select an item.</p>` : `
+    ${S.banner ? `<div class="banner">${esc(S.banner)} <button onclick="reloadSel()">Reload</button></div>` : ""}
+    <h3>#${it.id} ${esc(it.title)}</h3>
+    <div class="muted">${esc(it.team_name)} · ${it.type} · ${it.status} · v${it.version} · due ${esc(it.due_date || "—")} · your role: ${it.my_role}</div>
+    <p>${esc(it.description)}</p>
+    <p>Assignee: <b>${esc(it.assignee_name || "unassigned")}</b> · created by ${esc(it.created_by_name)}</p>
+    <div class="row">
+      ${!it.assignee_id && ["member","lead","admin"].includes(it.my_role) ? `<button class="primary" onclick="claim()">Claim</button>` : ""}
+      ${it.allowed_transitions.map(t => `<button onclick="move('${t}')">→ ${t}</button>`).join("")}
+      ${["member","lead","admin"].includes(it.my_role) ? `<select onchange="setPriority(this.value)">${["low","medium","high","urgent"].map(p => `<option ${it.priority === p ? "selected" : ""}>${p}</option>`).join("")}</select>` : ""}
+      ${S.members.length ? `<select onchange="assign(this.value)"><option value="">reassign…</option><option value="">(unassign)</option>${S.members.filter(m => m.role !== "viewer").map(m => `<option value="${m.id}">${esc(m.name)}</option>`).join("")}</select>` : ""}
+    </div>
+    <h4>Activity</h4>${S.activity.map(e => `<div class="ev"><b>${esc(e.actor_name)}</b> ${esc(describe(e))}<div class="muted">${esc(e.created_at)}</div></div>`).join("")}
+    ${["member","lead","admin"].includes(it.my_role) ? `<div class="row"><input id="cm" placeholder="add a comment" style="flex:1"><button onclick="comment()">Comment</button></div>` : ""}`}
+  </section></main>`;
+}
+S.token ? boot() : render();
+</script></body></html>

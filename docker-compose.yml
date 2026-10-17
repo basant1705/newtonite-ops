@@ -1,0 +1,9 @@
+services:
+  app:
+    build: .
+    ports: ["8000:8000"]
+    volumes: ["ops-data:/data"]
+    environment:
+      SEED_ITEMS: "3000"
+volumes:
+  ops-data:
